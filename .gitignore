@@ -1,0 +1,15 @@
+# Build output
+build/
+dist/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.claude
+
+# OS
+Thumbs.db
+.DS_Store
+
+*.pdf
