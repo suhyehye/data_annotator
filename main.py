@@ -98,11 +98,37 @@ _FALLBACK_COLORS = [
 ]
 
 
-def color_for(attribute: str) -> str:
+def _stable_hash(s: str) -> int:
+    """FNV-1a hash — stable across runs (unlike the salted built-in hash)."""
+    h = 2166136261
+    for ch in s:
+        h = ((h ^ ord(ch)) * 16777619) & 0xFFFFFFFF
+    return h
+
+
+def base_color_for(attribute: str) -> str:
     if attribute in ATTR_COLORS:
         return ATTR_COLORS[attribute]
-    idx = abs(hash(attribute)) % len(_FALLBACK_COLORS)
+    idx = _stable_hash(attribute) % len(_FALLBACK_COLORS)
     return _FALLBACK_COLORS[idx]
+
+
+def color_for(cls: str, attribute: str = "") -> str:
+    """Color for a (class, attribute) pair.
+
+    The attribute sets the base hue (so e.g. 'normal' stays green-ish
+    everywhere), while the class applies a deterministic hue/brightness shift
+    so the *same* attribute on a *different* class is still visually distinct.
+    """
+    base = QtGui.QColor(base_color_for(attribute))
+    if not cls:
+        return base.name()
+    h, s, v, a = base.getHsv()
+    seed = _stable_hash(cls)
+    h = (h + ((seed % 11) - 5) * 22) % 360                 # ±110° hue shift
+    s = max(80, min(255, s + (((seed // 11) % 5) - 2) * 30))
+    v = max(120, min(255, v + (((seed // 55) % 5) - 2) * 26))
+    return QtGui.QColor.fromHsv(int(h), int(s), int(v), a).name()
 
 
 def entry_key(cls: str, attr: str) -> str:
@@ -134,6 +160,7 @@ class PointMarker(QtWidgets.QGraphicsObject):
         self.entry_key: Optional[str] = None
         self.point_index: int = -1
         self._hover = False
+        self._label_visible = True
         self._drag_start_pos: Optional[QtCore.QPointF] = None
 
         self._font = QtGui.QFont()
@@ -153,8 +180,18 @@ class PointMarker(QtWidgets.QGraphicsObject):
         self._color = QtGui.QColor(color)
         self.update()
 
+    def set_label_visible(self, visible: bool):
+        if visible == self._label_visible:
+            return
+        self._label_visible = visible
+        self.prepareGeometryChange()
+        self.update()
+
     def boundingRect(self) -> QtCore.QRectF:
         r = self.RADIUS
+        if not self._label_visible:
+            m = r + 3
+            return QtCore.QRectF(-m, -m, m * 2, m * 2)
         label_w = self._label_rect.width() + 12
         label_h = self._label_rect.height() + 6
         w = r * 2 + 8 + label_w
@@ -178,6 +215,8 @@ class PointMarker(QtWidgets.QGraphicsObject):
         painter.drawLine(QtCore.QPointF(-r + 3, 0), QtCore.QPointF(r - 3, 0))
         painter.drawLine(QtCore.QPointF(0, -r + 3), QtCore.QPointF(0, r - 3))
         # label pill
+        if not self._label_visible:
+            return
         painter.setFont(self._font)
         lw = self._label_rect.width() + 12
         lh = self._label_rect.height() + 6
@@ -230,6 +269,7 @@ class ImageViewer(QtWidgets.QGraphicsView):
 
     image_clicked = QtCore.pyqtSignal(QtCore.QPointF)
     zoom_changed = QtCore.pyqtSignal(float)
+    cycle_attr = QtCore.pyqtSignal(int)  # -1 = prev attribute, +1 = next
 
     def __init__(self):
         super().__init__()
@@ -348,6 +388,10 @@ class ImageViewer(QtWidgets.QGraphicsView):
             self.scale(1.2, 1.2); self.zoom_changed.emit(self._current_scale()); return
         if event.key() == QtCore.Qt.Key_Minus:
             self.scale(1/1.2, 1/1.2); self.zoom_changed.emit(self._current_scale()); return
+        if event.key() == QtCore.Qt.Key_1:
+            self.cycle_attr.emit(-1); return
+        if event.key() == QtCore.Qt.Key_2:
+            self.cycle_attr.emit(1); return
         super().keyPressEvent(event)
 
     def keyReleaseEvent(self, event: QtGui.QKeyEvent):
@@ -380,6 +424,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._suppress_prompt_edit = False
         self._undo_stack: list[tuple] = []
         self._clipboard: dict = {}
+        self._hidden_entries: set[str] = set()  # entry_keys hidden on current image
+        self._labels_hidden = False  # F1: hide marker text labels on the canvas
+        self._annotations_path: Optional[Path] = None  # remembered save target
 
         self._build_ui()
         self._build_actions()
@@ -462,6 +509,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.viewer = ImageViewer()
         self.viewer.image_clicked.connect(self._on_canvas_click)
         self.viewer.zoom_changed.connect(self._on_zoom_changed)
+        self.viewer.cycle_attr.connect(self._cycle_attribute)
         splitter.addWidget(self.viewer)
 
         # right: panels ---------------------------------------------------- #
@@ -513,6 +561,8 @@ class MainWindow(QtWidgets.QMainWindow):
             "Right-click a point (or select + Delete) to remove.\n"
             "Drag a point to move it.\n"
             "Scroll = zoom · Middle-drag or Ctrl+drag or Space+drag = pan.\n"
+            "1 / 2 = prev / next attribute of current class.\n"
+            "F1 = hide / show marker labels · F2 = hide / show all annotations.\n"
             "D = prev image · F = next image · Ctrl+S = save."
         )
         hint.setObjectName("hint")
@@ -525,7 +575,16 @@ class MainWindow(QtWidgets.QMainWindow):
         ann_l = QtWidgets.QVBoxLayout(ann_box)
         self.entry_list = QtWidgets.QListWidget()
         self.entry_list.itemSelectionChanged.connect(self._on_entry_selection)
+        self.entry_list.itemChanged.connect(self._on_entry_check_changed)
         ann_l.addWidget(self.entry_list, 1)
+        vis_btns = QtWidgets.QHBoxLayout()
+        self.btn_show_all = QtWidgets.QPushButton("Show all")
+        self.btn_show_all.clicked.connect(lambda: self._set_all_entries_visible(True))
+        vis_btns.addWidget(self.btn_show_all)
+        self.btn_hide_all = QtWidgets.QPushButton("Hide all")
+        self.btn_hide_all.clicked.connect(lambda: self._set_all_entries_visible(False))
+        vis_btns.addWidget(self.btn_hide_all)
+        ann_l.addLayout(vis_btns)
         btns = QtWidgets.QHBoxLayout()
         self.btn_remove_entry = QtWidgets.QPushButton("Remove entry")
         self.btn_remove_entry.clicked.connect(self._remove_selected_entry)
@@ -536,10 +595,20 @@ class MainWindow(QtWidgets.QMainWindow):
         ann_l.addLayout(btns)
         right_l.addWidget(ann_box, 1)
 
-        # legend
-        leg_box = QtWidgets.QGroupBox("Attribute legend")
-        self.legend_layout = QtWidgets.QVBoxLayout(leg_box)
+        # legend (one row per class · attribute, since color now depends on both)
+        leg_box = QtWidgets.QGroupBox("Color legend (class · attribute)")
+        leg_outer = QtWidgets.QVBoxLayout(leg_box)
+        leg_outer.setContentsMargins(0, 0, 0, 0)
+        leg_scroll = QtWidgets.QScrollArea()
+        leg_scroll.setWidgetResizable(True)
+        leg_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        leg_scroll.setMaximumHeight(220)
+        leg_inner = QtWidgets.QWidget()
+        self.legend_layout = QtWidgets.QVBoxLayout(leg_inner)
         self.legend_layout.setSpacing(4)
+        self.legend_layout.setContentsMargins(2, 2, 2, 2)
+        leg_scroll.setWidget(leg_inner)
+        leg_outer.addWidget(leg_scroll)
         self._build_legend()
         right_l.addWidget(leg_box)
 
@@ -552,22 +621,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.status.addPermanentWidget(self.zoom_lbl)
 
     def _build_legend(self):
-        seen = set()
-        attrs = []
-        for cls in self.schema:
+        pairs = []
+        for cls in sorted(self.schema):
             for a in self.schema[cls]:
-                if a not in seen:
-                    seen.add(a); attrs.append(a)
-        for a in attrs:
+                pairs.append((cls, a))
+        for cls, a in pairs:
             row = QtWidgets.QHBoxLayout()
             row.setContentsMargins(0, 0, 0, 0)
             row.setSpacing(8)
             sw = QtWidgets.QLabel()
             sw.setObjectName("legendSwatch")
             sw.setFixedSize(14, 14)
-            sw.setStyleSheet(f"background:{color_for(a)};border-radius:3px;")
+            sw.setStyleSheet(f"background:{color_for(cls, a)};border-radius:3px;")
             row.addWidget(sw, 0, QtCore.Qt.AlignVCenter)
-            lbl = QtWidgets.QLabel(a)
+            lbl = QtWidgets.QLabel(f"{a} · {cls}")
             lbl.setObjectName("legendName")
             lbl.setAlignment(QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft)
             lbl.setSizePolicy(QtWidgets.QSizePolicy.Preferred,
@@ -637,6 +704,14 @@ class MainWindow(QtWidgets.QMainWindow):
         del_sc = QtWidgets.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Delete), self)
         del_sc.activated.connect(self._delete_selected_markers)
 
+        # F1 = hide / show the marker text labels on the canvas
+        labels_sc = QtWidgets.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_F1), self)
+        labels_sc.activated.connect(self._toggle_labels)
+
+        # F2 = hide / show all annotations on the current image
+        hide_sc = QtWidgets.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_F2), self)
+        hide_sc.activated.connect(self._toggle_hide_all)
+
         undo_sc = QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+Z"), self)
         undo_sc.activated.connect(self._undo)
 
@@ -670,6 +745,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.root_dir = root
         self.images = imgs
         self.annotations = {}
+        self._annotations_path = None
         self._undo_stack.clear()
         self._refresh_image_list()
         self.image_list.setCurrentRow(0)
@@ -688,6 +764,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.root_dir = p.parent
         self.images = [(p.name, p)]
         self.annotations = {}
+        self._annotations_path = None
         self._undo_stack.clear()
         self._refresh_image_list()
         self.image_list.setCurrentRow(0)
@@ -753,6 +830,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 normalized[img_key] = cleaned
         self.annotations = normalized
         self.schema = loaded_schema
+        self._annotations_path = Path(f)  # save back here by default
         self._undo_stack.clear()
         self._refresh_class_combo()
         self._rebuild_legend()
@@ -768,15 +846,20 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(self, "Nothing to save",
                                               "Open a folder or image first.")
             return
-        default = self.root_dir / "annotations.json"
-        target = str(default)
-        if as_ or not default.exists():
+        # Plain Save reuses the remembered target (the file loaded via Load
+        # Annotations, or the one last chosen in Save As). Only prompt when
+        # there is no remembered target yet, or for an explicit Save As.
+        if as_ or self._annotations_path is None:
+            default = self._annotations_path or (self.root_dir / "annotations.json")
             f, _ = QtWidgets.QFileDialog.getSaveFileName(
-                self, "Save annotations.json", target, "JSON (*.json)"
+                self, "Save annotations.json", str(default), "JSON (*.json)"
             )
             if not f:
                 return
             target = f
+            self._annotations_path = Path(target)
+        else:
+            target = str(self._annotations_path)
         cleaned = {k: v for k, v in self.annotations.items() if v}
         try:
             with open(target, "w", encoding="utf-8") as fp:
@@ -785,8 +868,11 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(self, "Save failed", str(e))
             return
         self._dirty = False
-        self.status.showMessage(f"Saved {len(cleaned)} annotated image(s) → {target}", 4000)
-        self._update_status()
+        self.status.showMessage(
+            f"저장되었습니다  ·  {len(cleaned)} annotated image(s) → {target}", 4000)
+        QtWidgets.QMessageBox.information(
+            self, "저장 완료",
+            f"저장되었습니다.\n\n{len(cleaned)}개 이미지의 annotation\n→ {target}")
 
     def _maybe_prompt_save(self) -> bool:
         if not self._dirty:
@@ -851,6 +937,7 @@ class MainWindow(QtWidgets.QMainWindow):
                                           f"Failed to read {abs_path}")
             return
         self.markers = []
+        self._hidden_entries.clear()
         self._reload_markers()
         self._refresh_entry_list()
         self._update_status()
@@ -914,6 +1001,23 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_attr_changed(self, _text: str):
         self._update_color_swatch()
 
+    def _cycle_attribute(self, direction: int):
+        """Step the active attribute backward (1 key) / forward (2 key)
+        through the current class's attribute list, wrapping around."""
+        cls = self.class_combo.currentText().strip()
+        attrs = self.schema.get(cls, [])
+        if not attrs:
+            return
+        cur = self.attr_combo.currentText().strip()
+        try:
+            i = attrs.index(cur)
+        except ValueError:
+            i = 0
+            direction = 0
+        i = (i + direction) % len(attrs)
+        self.attr_combo.setCurrentText(attrs[i])
+        self.status.showMessage(f"Attribute: {attrs[i]}  ({cls})", 1500)
+
     def _prompt_for(self, cls: str, attr: str) -> str:
         """Return the prompt/key for a (class, attribute) pair.
 
@@ -927,7 +1031,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _update_color_swatch(self):
         cls = self.class_combo.currentText().strip()
         a = self.attr_combo.currentText().strip()
-        c = color_for(a) if a else "#666"
+        c = color_for(cls, a) if a else "#666"
         self.color_swatch.setStyleSheet(f"background:{c};border-radius:3px;")
         # update prompt edit without firing textEdited
         self._suppress_prompt_edit = True
@@ -1122,6 +1226,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._push_undo_snapshot(rel)
         ek = self._prompt_for(cls, attr)
+        # If this entry was hidden (e.g. after "hide all"), reveal it so the
+        # point the user is placing is actually visible.
+        self._hidden_entries.discard(ek)
         img_entries = self.annotations.setdefault(rel, {})
         # locate any existing entry for this (cls, attr), regardless of key
         existing_key = None
@@ -1141,13 +1248,14 @@ class MainWindow(QtWidgets.QMainWindow):
         entry["points"].append([round(pos.x(), 2), round(pos.y(), 2)])
         idx = len(entry["points"]) - 1
         self._add_marker(ek, idx, pos.x(), pos.y(), cls, attr)
+        self._apply_entry_visibility()  # reveal any existing markers of this entry
         self._dirty = True
         self._refresh_entry_list()
         self._refresh_image_list_row(rel)
 
     def _add_marker(self, ek: str, point_index: int, x: float, y: float,
                     cls: str, attr: str):
-        m = PointMarker(color_for(attr), ek)
+        m = PointMarker(color_for(cls, attr), ek)
         m.entry_key = ek
         m.point_index = point_index
         m.setPos(x, y)
@@ -1156,6 +1264,9 @@ class MainWindow(QtWidgets.QMainWindow):
         m.left_clicked.connect(self._on_marker_left_clicked)
         m.drag_finished.connect(self._on_marker_drag_finished)
         m.setToolTip(f"{attr} · {cls}")
+        m.set_label_visible(not self._labels_hidden)
+        if ek in self._hidden_entries:
+            m.setVisible(False)
         self.viewer.annotation_scene().addItem(m)
         self.markers.append(m)
 
@@ -1244,11 +1355,65 @@ class MainWindow(QtWidgets.QMainWindow):
                 n = len(ent["points"])
                 it = QtWidgets.QListWidgetItem(f"{ek}  ({n})")
                 it.setData(QtCore.Qt.UserRole, ek)
-                color = QtGui.QColor(color_for(ent["attribute"]))
+                color = QtGui.QColor(color_for(ent["class"], ent["attribute"]))
                 pix = QtGui.QPixmap(12, 12); pix.fill(color)
                 it.setIcon(QtGui.QIcon(pix))
+                # checkbox toggles visibility of this entry's markers
+                it.setFlags(it.flags() | QtCore.Qt.ItemIsUserCheckable)
+                it.setCheckState(
+                    QtCore.Qt.Unchecked if ek in self._hidden_entries
+                    else QtCore.Qt.Checked
+                )
                 self.entry_list.addItem(it)
         self.entry_list.blockSignals(False)
+
+    def _on_entry_check_changed(self, item: QtWidgets.QListWidgetItem):
+        ek = item.data(QtCore.Qt.UserRole)
+        if ek is None:
+            return
+        if item.checkState() == QtCore.Qt.Checked:
+            self._hidden_entries.discard(ek)
+        else:
+            self._hidden_entries.add(ek)
+        self._apply_entry_visibility()
+
+    def _apply_entry_visibility(self):
+        for m in self.markers:
+            m.setVisible(m.entry_key not in self._hidden_entries)
+
+    def _set_all_entries_visible(self, visible: bool):
+        rel = self.current_rel()
+        if not rel:
+            return
+        if visible:
+            self._hidden_entries.clear()
+        else:
+            self._hidden_entries = set(self.annotations.get(rel, {}).keys())
+        self._apply_entry_visibility()
+        self._refresh_entry_list()
+
+    def _toggle_labels(self):
+        """F1: hide / show the text label pills on every marker (dots stay)."""
+        self._labels_hidden = not self._labels_hidden
+        for m in self.markers:
+            m.set_label_visible(not self._labels_hidden)
+        self.status.showMessage(
+            "Labels hidden" if self._labels_hidden else "Labels shown", 1500)
+
+    def _toggle_hide_all(self):
+        """F2: hide every annotation on the current image, or show
+        them all again if anything is currently hidden. Non-destructive."""
+        rel = self.current_rel()
+        if not rel:
+            return
+        entries = self.annotations.get(rel, {})
+        if not entries:
+            return
+        any_visible = any(ek not in self._hidden_entries for ek in entries)
+        self._set_all_entries_visible(not any_visible)
+        self.status.showMessage(
+            "Hid all annotations on this image" if any_visible
+            else "Showing all annotations on this image", 1500)
 
     def _on_entry_selection(self):
         items = self.entry_list.selectedItems()
@@ -1291,6 +1456,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for m in self.markers:
             self.viewer.annotation_scene().removeItem(m)
         self.markers = []
+        self._hidden_entries.clear()
         self._dirty = True
         self._refresh_entry_list()
         self._refresh_image_list_row(rel)
