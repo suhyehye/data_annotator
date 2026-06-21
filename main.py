@@ -33,6 +33,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import random
 import sys
 from pathlib import Path
 from typing import Optional
@@ -426,6 +427,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._clipboard: dict = {}
         self._hidden_entries: set[str] = set()  # entry_keys hidden on current image
         self._labels_hidden = False  # F1: hide marker text labels on the canvas
+        self._color_overrides: dict[tuple[str, str], str] = {}  # (cls,attr)->hex
         self._annotations_path: Optional[Path] = None  # remembered save target
 
         self._build_ui()
@@ -533,10 +535,28 @@ class MainWindow(QtWidgets.QMainWindow):
         self.attr_combo.lineEdit().setPlaceholderText("Select or type an attribute")
         self.attr_combo.currentTextChanged.connect(self._on_attr_changed)
         sel_l.addWidget(self.attr_combo, 1, 1)
+        color_row = QtWidgets.QHBoxLayout()
+        color_row.setContentsMargins(0, 0, 0, 0)
+        color_row.setSpacing(6)
         self.color_swatch = QtWidgets.QLabel()
-        self.color_swatch.setFixedHeight(8)
+        self.color_swatch.setMinimumHeight(18)
         self.color_swatch.setStyleSheet("background:#22c55e;border-radius:3px;")
-        sel_l.addWidget(self.color_swatch, 2, 0, 1, 2)
+        color_row.addWidget(self.color_swatch, 1)
+        self.btn_pick_color = QtWidgets.QPushButton("색 변경")
+        self.btn_pick_color.setToolTip("Pick a custom color for this class · attribute")
+        self.btn_pick_color.clicked.connect(self._pick_color)
+        color_row.addWidget(self.btn_pick_color)
+        self.btn_random_color = QtWidgets.QPushButton("랜덤 색")
+        self.btn_random_color.setToolTip("Assign a random, clearly different color")
+        self.btn_random_color.clicked.connect(self._random_color)
+        color_row.addWidget(self.btn_random_color)
+        self.btn_reset_color = QtWidgets.QPushButton("색 초기화")
+        self.btn_reset_color.setToolTip("Reset to the auto-generated color")
+        self.btn_reset_color.clicked.connect(self._reset_color)
+        color_row.addWidget(self.btn_reset_color)
+        color_wrap = QtWidgets.QWidget()
+        color_wrap.setLayout(color_row)
+        sel_l.addWidget(color_wrap, 2, 0, 1, 2)
         sel_l.addWidget(QtWidgets.QLabel("Prompt"), 3, 0)
         prompt_row = QtWidgets.QHBoxLayout()
         prompt_row.setContentsMargins(0, 0, 0, 0)
@@ -632,7 +652,7 @@ class MainWindow(QtWidgets.QMainWindow):
             sw = QtWidgets.QLabel()
             sw.setObjectName("legendSwatch")
             sw.setFixedSize(14, 14)
-            sw.setStyleSheet(f"background:{color_for(cls, a)};border-radius:3px;")
+            sw.setStyleSheet(f"background:{self._color_for(cls, a)};border-radius:3px;")
             row.addWidget(sw, 0, QtCore.Qt.AlignVCenter)
             lbl = QtWidgets.QLabel(f"{a} · {cls}")
             lbl.setObjectName("legendName")
@@ -1028,10 +1048,70 @@ class MainWindow(QtWidgets.QMainWindow):
             return ""
         return self.prompt_overrides.get((cls, attr), entry_key(cls, attr))
 
+    def _color_for(self, cls: str, attr: str) -> str:
+        """Color for (class, attribute), honoring any manual override."""
+        ov = self._color_overrides.get((cls, attr))
+        return ov if ov else color_for(cls, attr)
+
+    def _pick_color(self):
+        cls = self.class_combo.currentText().strip()
+        attr = self.attr_combo.currentText().strip()
+        if not cls or not attr:
+            return
+        initial = QtGui.QColor(self._color_for(cls, attr))
+        c = QtWidgets.QColorDialog.getColor(
+            initial, self, f"Pick color for  {attr} · {cls}")
+        if not c.isValid():
+            return
+        self._color_overrides[(cls, attr)] = c.name()
+        self._apply_color_change(cls, attr)
+        self.status.showMessage(f"Color set for {attr} · {cls}: {c.name()}", 2000)
+
+    def _random_color(self):
+        cls = self.class_combo.currentText().strip()
+        attr = self.attr_combo.currentText().strip()
+        if not cls or not attr:
+            return
+        cur = QtGui.QColor(self._color_for(cls, attr))
+        c = QtGui.QColor("#888888")
+        for _ in range(16):
+            h = random.randint(0, 359)
+            s = random.randint(150, 235)
+            v = random.randint(170, 240)
+            c = QtGui.QColor.fromHsv(h, s, v)
+            # keep it clearly distinct from the current hue
+            if cur.hue() < 0 or abs(((h - cur.hue()) + 180) % 360 - 180) > 45:
+                break
+        self._color_overrides[(cls, attr)] = c.name()
+        self._apply_color_change(cls, attr)
+        self.status.showMessage(f"Random color for {attr} · {cls}: {c.name()}", 2000)
+
+    def _reset_color(self):
+        cls = self.class_combo.currentText().strip()
+        attr = self.attr_combo.currentText().strip()
+        if not cls or not attr:
+            return
+        if self._color_overrides.pop((cls, attr), None) is None:
+            return
+        self._apply_color_change(cls, attr)
+        self.status.showMessage(f"Color reset for {attr} · {cls}", 2000)
+
+    def _apply_color_change(self, cls: str, attr: str):
+        col = self._color_for(cls, attr)
+        rel = self.current_rel()
+        entries = self.annotations.get(rel, {}) if rel else {}
+        for m in self.markers:
+            ent = entries.get(m.entry_key)
+            if ent and ent["class"] == cls and ent["attribute"] == attr:
+                m.set_color(col)
+        self._update_color_swatch()
+        self._refresh_entry_list()
+        self._rebuild_legend()
+
     def _update_color_swatch(self):
         cls = self.class_combo.currentText().strip()
         a = self.attr_combo.currentText().strip()
-        c = color_for(cls, a) if a else "#666"
+        c = self._color_for(cls, a) if a else "#666"
         self.color_swatch.setStyleSheet(f"background:{c};border-radius:3px;")
         # update prompt edit without firing textEdited
         self._suppress_prompt_edit = True
@@ -1255,7 +1335,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _add_marker(self, ek: str, point_index: int, x: float, y: float,
                     cls: str, attr: str):
-        m = PointMarker(color_for(cls, attr), ek)
+        m = PointMarker(self._color_for(cls, attr), ek)
         m.entry_key = ek
         m.point_index = point_index
         m.setPos(x, y)
@@ -1355,7 +1435,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 n = len(ent["points"])
                 it = QtWidgets.QListWidgetItem(f"{ek}  ({n})")
                 it.setData(QtCore.Qt.UserRole, ek)
-                color = QtGui.QColor(color_for(ent["class"], ent["attribute"]))
+                color = QtGui.QColor(self._color_for(ent["class"], ent["attribute"]))
                 pix = QtGui.QPixmap(12, 12); pix.fill(color)
                 it.setIcon(QtGui.QIcon(pix))
                 # checkbox toggles visibility of this entry's markers
